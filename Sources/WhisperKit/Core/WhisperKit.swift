@@ -266,7 +266,7 @@ public class WhisperKit {
 
             modelVariant = detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
             Logging.debug("Loading tokenizer for \(modelVariant)")
-            tokenizer = try await AutoTokenizer.from(tokenizerConfig: configuration(from: tokenizerConfigUrl), tokenizerData: tokenizerDataUrl)
+            tokenizer = try await AutoTokenizer.from(tokenizerConfig: configuration(from: tokenizerConfigUrl), tokenizerData: configuration(from: tokenizerDataUrl))
 
             textDecoder.tokenizer = tokenizer
             Logging.debug("Loaded tokenizer")
