@@ -197,6 +197,8 @@ public class WhisperKit {
         let encoderUrl = path.appending(path: "AudioEncoder.mlmodelc")
         let decoderUrl = path.appending(path: "TextDecoder.mlmodelc")
         let decoderPrefillUrl = path.appending(path: "TextDecoderContextPrefill.mlmodelc")
+        let tokenizerConfigUrl = path.appending(path: "tokenizer_config.json")
+        let tokenizerDataUrl = path.appending(path: "tokenizer.json")
 
         try [logmelUrl, encoderUrl, decoderUrl].forEach {
             if !FileManager.default.fileExists(atPath: $0.path) {
@@ -255,9 +257,17 @@ public class WhisperKit {
         if let logitsDim = textDecoder.logitsSize,
            let encoderDim = audioEncoder.embedSize
         {
+            func configuration(from url: URL) throws -> Config {
+                let data = try Data(contentsOf: url)
+                let parsed = try JSONSerialization.jsonObject(with: data, options: [])
+                guard let dictionary = parsed as? [String: Any] else { throw Hub.HubClientError.parse }
+                return Config(dictionary)
+            }
+
             modelVariant = detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
             Logging.debug("Loading tokenizer for \(modelVariant)")
-            tokenizer = try await loadTokenizer(for: modelVariant)
+            tokenizer = try await AutoTokenizer.from(tokenizerConfig: configuration(from: tokenizerConfigUrl), tokenizerData: tokenizerDataUrl)
+
             textDecoder.tokenizer = tokenizer
             Logging.debug("Loaded tokenizer")
         } else {
