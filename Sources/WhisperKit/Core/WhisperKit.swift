@@ -353,9 +353,9 @@ public class WhisperKit: Transcriber {
                     tokenizerFolder: tokenizerFolder,
                     useBackgroundSession: useBackgroundDownloadSession
                 )
-                self.tokenizer = tokenizer
-                textDecoder.tokenizer = tokenizer
-                Logging.debug("Loaded tokenizer")
+        self.tokenizer = tokenizer
+        textDecoder.tokenizer = tokenizer
+        Logging.debug("Loaded tokenizer")
         Logging.debug("Loaded tokenizer")
 
         modelState = .loaded
