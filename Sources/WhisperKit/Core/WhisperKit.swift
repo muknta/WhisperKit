@@ -9,16 +9,21 @@ import Hub
 import TensorUtils
 import Tokenizers
 
-@available(macOS 14, iOS 17, tvOS 14, watchOS 10, *)
-public class WhisperKit {
-    // Models
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public protocol Transcriber {
+    func transcribe(audioPath: String, decodeOptions: DecodingOptions?, callback: TranscriptionCallback) async throws -> TranscriptionResult?
+    func transcribe(audioArray: [Float], decodeOptions: DecodingOptions?, callback: TranscriptionCallback) async throws -> TranscriptionResult?
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public class WhisperKit: Transcriber {
+    /// Models
     public var modelVariant: ModelVariant = .tiny
     public var modelState: ModelState = .unloaded
     public var modelCompute: ModelComputeOptions
-    public var modelFolder: URL
-    public var tokenizer: Tokenizer?
+    public var tokenizer: WhisperTokenizer?
 
-    // Protocols
+    /// Protocols
     public var audioProcessor: any AudioProcessing
     public var featureExtractor: any FeatureExtracting
     public var audioEncoder: any AudioEncoding
@@ -26,7 +31,7 @@ public class WhisperKit {
     public var logitsFilters: [any LogitsFiltering]
     public var segmentSeeker: any SegmentSeeking
 
-    // Shapes
+    /// Shapes
     public static var maxTokenContext = Int(448 / 2)
     public static var sampleRate: Int = 16000
     public static var hopLength: Int = 160
@@ -34,17 +39,27 @@ public class WhisperKit {
     public static var windowSamples: Int = 480_000 // sampleRate * chunkLength
     public static var secondsPerTimeToken = Float(0.02)
 
-    // Features
+    /// Features
     public var audioSamples: MLMultiArray?
     public var melOutput: MLMultiArray?
     public var encoderOutput: MLMultiArray?
     public var decoderInputs: DecodingInputs?
     public var currentTimings: TranscriptionTimings?
 
+    /// State
+    public let progress = Progress()
+
+    /// Configuration
+    public var modelFolder: URL?
+    public var tokenizerFolder: URL?
+    private let useBackgroundDownloadSession: Bool
+
     public init(
         model: String? = nil,
-        modelFolder: String? = nil,
+        downloadBase: URL? = nil,
         modelRepo: String? = nil,
+        modelFolder: String? = nil,
+        tokenizerFolder: URL? = nil,
         computeOptions: ModelComputeOptions? = nil,
         audioProcessor: (any AudioProcessing)? = nil,
         featureExtractor: (any FeatureExtracting)? = nil,
@@ -55,43 +70,36 @@ public class WhisperKit {
         verbose: Bool = true,
         logLevel: Logging.LogLevel = .info,
         prewarm: Bool? = nil,
-        load: Bool? = nil
+        load: Bool? = nil,
+        download: Bool = true,
+        useBackgroundDownloadSession: Bool = false
     ) async throws {
         self.modelCompute = computeOptions ?? ModelComputeOptions()
-
         self.audioProcessor = audioProcessor ?? AudioProcessor()
         self.featureExtractor = featureExtractor ?? FeatureExtractor()
         self.audioEncoder = audioEncoder ?? AudioEncoder()
         self.textDecoder = textDecoder ?? TextDecoder()
         self.logitsFilters = logitsFilters ?? []
         self.segmentSeeker = segmentSeeker ?? SegmentSeeker()
-        let modelVariant = model ?? WhisperKit.recommendedModels().default
+        self.tokenizerFolder = tokenizerFolder
+        self.useBackgroundDownloadSession = useBackgroundDownloadSession
         Logging.shared.logLevel = verbose ? logLevel : .none
-
         currentTimings = TranscriptionTimings()
 
-        // If modelFolder string is passed, load based on that
-        if let folder = modelFolder {
-            self.modelFolder = URL(filePath: folder)
-        } else {
-            // Otherwise, load model from hub
-            let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
-            if let hubModelFolder = try await Self.load(variant: modelVariant, from: repo) {
-                self.modelFolder = hubModelFolder
-            } else {
-                // If model can't be found
-                self.modelFolder = URL(filePath: "openai_whisperkit-base")
-                return
-            }
-        }
+        try await setupModels(
+            model: model,
+            downloadBase: downloadBase,
+            modelRepo: modelRepo,
+            modelFolder: modelFolder,
+            download: download
+        )
 
-        if prewarm ?? false {
+        if let prewarm = prewarm, prewarm {
             Logging.info("Prewarming models...")
             try await prewarmModels()
         }
 
-        // If load is not passed, load based on whether a model is passed
-        // Otherwise we assume the user will call loadModels() themselves
+        // If load is not passed in, load based on whether a modelFolder is passed
         if load ?? (modelFolder != nil) {
             Logging.info("Loading models...")
             try await loadModels()
@@ -101,6 +109,15 @@ public class WhisperKit {
     // MARK: - Model Loading
 
     public static func recommendedModels() -> (default: String, disabled: [String]) {
+        let deviceName = Self.deviceName()
+        Logging.debug("Running on \(deviceName)")
+
+        let defaultModel = modelSupport(for: deviceName).default
+        let disabledModels = modelSupport(for: deviceName).disabled
+        return (defaultModel, disabledModels)
+    }
+
+    public static func deviceName() -> String {
         var utsname = utsname()
         uname(&utsname)
         let deviceName = withUnsafePointer(to: &utsname.machine) {
@@ -108,17 +125,12 @@ public class WhisperKit {
                 String(cString: $0)
             }
         }
-
-        let defaultModel = modelSupport(for: deviceName).default
-        let disabledModels = modelSupport(for: deviceName).disabled
-        return (defaultModel, disabledModels)
+        return deviceName
     }
 
-    public static func fetchAvailableModels(from repo: String = "argmaxinc/whisperkit-coreml") async throws -> [String] {
+    public static func fetchAvailableModels(from repo: String = "argmaxinc/whisperkit-coreml", matching: [String] = ["openai_*", "distil-whisper_*"]) async throws -> [String] {
         let hubApi = HubApi()
-        // TODO: get config from the source repo
-        _ = try await hubApi.httpGet(for: URL(string: "https://huggingface.co/argmaxinc/whisperkit-coreml/blob/main/config.json")!)
-        let modelFiles = try await hubApi.getFilenames(from: repo, matching: ["openai_whisper*"])
+        let modelFiles = try await hubApi.getFilenames(from: repo, matching: matching)
 
         return formatModelFiles(modelFiles)
     }
@@ -135,10 +147,7 @@ public class WhisperKit {
         })
 
         let availableModels = filteredVariants.map { variant -> String in
-            let parts = variant.split(separator: "_")
-            let modelInfo = parts[1].split(separator: "-").dropFirst().joined(separator: "-")
-            let additionalInfo = parts.count > 2 ? "_\(parts[2...].joined(separator: "_"))" : ""
-            return (modelInfo + additionalInfo).trimmingFromEnd(character: "/", upto: 1)
+            variant.trimmingFromEnd(character: "/", upto: 1)
         }
 
         // Sorting order based on enum
@@ -162,34 +171,106 @@ public class WhisperKit {
         return sortedModels
     }
 
-    public static func load(variant: String, from repo: String = "argmaxinc/whisperkit-coreml", progressCallback: ((Progress) -> Void)? = nil) async throws -> URL? {
-        let hubApi = HubApi()
+    public static func download(
+        variant: String,
+        downloadBase: URL? = nil,
+        useBackgroundSession: Bool = false,
+        from repo: String = "argmaxinc/whisperkit-coreml",
+        progressCallback: ((Progress) -> Void)? = nil
+    ) async throws -> URL {
+        let hubApi = HubApi(downloadBase: downloadBase, useBackgroundSession: useBackgroundSession)
         let repo = Hub.Repo(id: repo, type: .models)
+        let modelSearchPath = "*\(variant.description)/*"
         do {
-            let modelFolder = try await hubApi.snapshot(from: repo, matching: ["*\(variant.description)/*"]) { progress in
-                Logging.debug(progress)
-                progressCallback?(progress)
+            Logging.debug("Searching for models matching \"\(modelSearchPath)\" in \(repo)")
+            let modelFiles = try await hubApi.getFilenames(from: repo, matching: [modelSearchPath])
+            var uniquePaths = Set(modelFiles.map { $0.components(separatedBy: "/").first! })
+
+            var variantPath: String? = nil
+
+            if uniquePaths.count == 1 {
+                variantPath = uniquePaths.first
+            } else {
+                // If the model name search returns more than one unique model folder, then prepend the default "openai" prefix from whisperkittools to disambiguate
+                Logging.debug("Multiple models found matching \"\(modelSearchPath)\"")
+                let adjustedModelSearchPath = "*openai*\(variant.description)/*"
+                Logging.debug("Searching for models matching \"\(adjustedModelSearchPath)\" in \(repo)")
+                let adjustedModelFiles = try await hubApi.getFilenames(from: repo, matching: [adjustedModelSearchPath])
+                uniquePaths = Set(adjustedModelFiles.map { $0.components(separatedBy: "/").first! })
+
+                if uniquePaths.count == 1 {
+                    variantPath = uniquePaths.first
+                }
             }
 
-            let modelFolderName = modelFolder.appending(path: "openai_whisper-\(variant)")
+            guard let variantPath else {
+                // If there is still ambiguity, throw an error
+                throw WhisperError.modelsUnavailable("Multiple models found matching \"\(modelSearchPath)\"")
+            }
+
+            Logging.debug("Downloading model \(variantPath)...")
+            let modelFolder = try await hubApi.snapshot(from: repo, matching: [modelSearchPath]) { progress in
+                Logging.debug(progress)
+                if let callback = progressCallback {
+                    callback(progress)
+                }
+            }
+
+            let modelFolderName = modelFolder.appending(path: variantPath)
             return modelFolderName
         } catch {
             Logging.debug(error)
+            throw error
         }
+    }
 
-        return nil
+    /// Sets up the model folder either from a local path or by downloading from a repository.
+    public func setupModels(
+        model: String?,
+        downloadBase: URL? = nil,
+        modelRepo: String?,
+        modelFolder: String?,
+        download: Bool
+    ) async throws {
+        // Determine the model variant to use
+        let modelVariant = model ?? WhisperKit.recommendedModels().default
+
+        // If a local model folder is provided, use it; otherwise, download the model
+        if let folder = modelFolder {
+            self.modelFolder = URL(fileURLWithPath: folder)
+        } else if download {
+            let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
+            do {
+                self.modelFolder = try await Self.download(
+                    variant: modelVariant,
+                    downloadBase: downloadBase,
+                    useBackgroundSession: useBackgroundDownloadSession,
+                    from: repo
+                )
+            } catch {
+                // Handle errors related to model downloading
+                throw WhisperError.modelsUnavailable("""
+                Model not found. Please check the model or repo name and try again.
+                Error: \(error)
+                """)
+            }
+        }
     }
 
     public func prewarmModels() async throws {
         try await loadModels(prewarmMode: true)
     }
 
-    public func loadModels(prewarmMode: Bool = false) async throws {
+    public func loadModels(
+        prewarmMode: Bool = false
+    ) async throws {
         modelState = prewarmMode ? .prewarming : .loading
 
         let modelLoadStart = CFAbsoluteTimeGetCurrent()
 
-        let path = modelFolder
+        guard let path = modelFolder else {
+            throw WhisperError.modelsUnavailable("Model folder is not set.")
+        }
 
         Logging.debug("Loading models from \(path.path) with prewarmMode: \(prewarmMode)")
 
@@ -200,9 +281,9 @@ public class WhisperKit {
         let tokenizerConfigUrl = path.appending(path: "tokenizer_config.json")
         let tokenizerDataUrl = path.appending(path: "tokenizer.json")
 
-        try [logmelUrl, encoderUrl, decoderUrl].forEach {
-            if !FileManager.default.fileExists(atPath: $0.path) {
-                throw WhisperError.modelsUnavailable()
+        for item in [logmelUrl, encoderUrl, decoderUrl] {
+            if !FileManager.default.fileExists(atPath: item.path) {
+                throw WhisperError.modelsUnavailable("Model file not found at \(item.path)")
             }
         }
 
@@ -254,25 +335,24 @@ public class WhisperKit {
         }
 
         // Check model dimensions to assign appropriate tokenizer
-        if let logitsDim = textDecoder.logitsSize,
-           let encoderDim = audioEncoder.embedSize
-        {
-            func configuration(from url: URL) throws -> Config {
-                let data = try Data(contentsOf: url)
-                let parsed = try JSONSerialization.jsonObject(with: data, options: [])
-                guard let dictionary = parsed as? [String: Any] else { throw Hub.HubClientError.parse }
-                return Config(dictionary)
-            }
-
-            modelVariant = detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
-            Logging.debug("Loading tokenizer for \(modelVariant)")
-            tokenizer = try await AutoTokenizer.from(tokenizerConfig: configuration(from: tokenizerConfigUrl), tokenizerData: configuration(from: tokenizerDataUrl))
-
-            textDecoder.tokenizer = tokenizer
-            Logging.debug("Loaded tokenizer")
-        } else {
-            Logging.error("Could not load tokenizer")
+        guard let logitsDim = textDecoder.logitsSize, let encoderDim = audioEncoder.embedSize else {
+            throw WhisperError.tokenizerUnavailable()
         }
+        func configuration(from url: URL) throws -> Config {
+            let data = try Data(contentsOf: url)
+            let parsed = try JSONSerialization.jsonObject(with: data, options: [])
+            guard let dictionary = parsed as? [String: Any] else { throw Hub.HubClientError.parse }
+            return Config(dictionary)
+        }
+
+        textDecoder.isModelMultilingual = isModelMultilingual(logitsDim: logitsDim)
+        modelVariant = detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
+        Logging.debug("Loading tokenizer for \(modelVariant)")
+        let tokenizer = try await AutoTokenizer.from(tokenizerConfig: configuration(from: tokenizerConfigUrl), tokenizerData: configuration(from: tokenizerDataUrl))
+
+        self.tokenizer = tokenizer
+        textDecoder.tokenizer = tokenizer
+        Logging.debug("Loaded tokenizer")
 
         modelState = .loaded
 
@@ -284,7 +364,7 @@ public class WhisperKit {
     public func unloadModels() async {
         modelState = .unloading
 
-        [featureExtractor, audioEncoder, textDecoder].forEach { model in
+        for model in [featureExtractor, audioEncoder, textDecoder] {
             if var model = model as? WhisperMLModel {
                 model.unloadModel()
             }
@@ -348,6 +428,7 @@ public class WhisperKit {
                            decodeOptions: DecodingOptions? = nil,
                            callback: TranscriptionCallback = nil) async throws -> TranscriptionResult?
     {
+        progress.completedUnitCount = 0
         if currentTimings == nil {
             currentTimings = TranscriptionTimings()
         }
@@ -361,6 +442,8 @@ public class WhisperKit {
 
         var options = decodeOptions ?? DecodingOptions()
         options.verbose = Logging.shared.logLevel != .none
+
+        var detectedLanguage: String?
 
         let contentFrames = audioArray.count
         timings.inputAudioSeconds = Double(Int(contentFrames) / WhisperKit.sampleRate) - Double(decodeOptions?.clipTimestamps.first ?? 0)
@@ -378,7 +461,7 @@ public class WhisperKit {
         }
 
         let startDecoderInit = CFAbsoluteTimeGetCurrent()
-        decoderInputs = textDecoder.prepareDecoderInputs(withPrompt: [tokenizer.startOfTranscriptToken])
+        decoderInputs = textDecoder.prepareDecoderInputs(withPrompt: [tokenizer.specialTokens.startOfTranscriptToken])
         guard var decoderInputs = decoderInputs else {
             throw WhisperError.prefillFailed("Unable to prepare decoder inputs")
         }
@@ -391,7 +474,7 @@ public class WhisperKit {
         let prefillStartTime = CFAbsoluteTimeGetCurrent()
         var prefilledCacheSize = 0
         if options.usePrefillPrompt {
-            guard let prefilledInputs = try? await textDecoder.prefillDecoderInputs(decoderInputs, withOptions: options, multilingual: modelVariant.isMultilingual) else {
+            guard let prefilledInputs = try? await textDecoder.prefillDecoderInputs(decoderInputs, withOptions: options) else {
                 throw WhisperError.prefillFailed()
             }
             decoderInputs = prefilledInputs
@@ -400,8 +483,7 @@ public class WhisperKit {
         let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStartTime
         timings.prefill = prefillTime
 
-        // Add intial prompt to history
-        let currentTokens = decoderInputs.initialPrompt
+
 
         // Setup masks based on prefill values
         prefilledCacheSize += 1 // Add 1 for initial masked cache update
@@ -410,10 +492,8 @@ public class WhisperKit {
             decoderInputs.decoderKeyPaddingMask[i] = 0.0
         }
 
-        allTokens.append(contentsOf: currentTokens)
-
         Logging.debug("Prefill time: \(prefillTime)")
-        Logging.debug("Prefill prompt: \(currentTokens.map { tokenizer.convertIdToToken($0) ?? "" })")
+        Logging.debug("Prefill prompt: \(decoderInputs.initialPrompt.map { tokenizer.convertIdToToken($0) ?? "" })")
 
         // MARK: - Main decoder loop
 
@@ -437,10 +517,15 @@ public class WhisperKit {
 
         let startDecodeLoopTime = CFAbsoluteTimeGetCurrent()
 
+        let totalSeekDuration = seekClips.reduce(0) { $0 + ($1.end - $1.start) }
+        progress.totalUnitCount = Int64(totalSeekDuration)
+        defer { progress.completedUnitCount = progress.totalUnitCount }
         for (seekClipStart, seekClipEnd) in seekClips {
             // Loop through the current clip until we reach the end
             // Typically this will be the full audio file, unless seek points are explicitly provided
             var seek: Int = seekClipStart
+
+            let previousSeekProgress = progress.completedUnitCount
 
             let windowPadding = 16000 // prevent hallucinations at the end of the clip by stopping up to 1.0s early
             while seek < seekClipEnd - windowPadding {
@@ -460,7 +545,7 @@ public class WhisperKit {
                 timings.totalAudioProcessingRuns += 1
 
                 let melStart = Date()
-                guard let melOutput = try? await featureExtractor.logMelSpectrogram(fromAudio: audioSamples) else {
+                guard let melOutput = try await featureExtractor.logMelSpectrogram(fromAudio: audioSamples) else {
                     Logging.error("Mel output is nil")
                     return nil
                 }
@@ -477,37 +562,73 @@ public class WhisperKit {
                 timings.encoding += encoderTime
                 timings.totalEncodingRuns += 1
 
-                // All features are computed, send to decoder
+                // All features are computed, now we can decode
                 Logging.info("Decoding \(timeOffset)s - \(timeOffsetEnd)s")
-                if timeOffset + 1 > timeOffsetEnd {
-                    print("broken")
-                }
-                guard let decodingResult = try? await decodeWithFallback(encoderSegment: encoderOutput, decodingOptions: options, callback: callback) else {
+
+                // Send to decoder to predict text tokens with fallback
+                guard let decodingResult = try await decodeWithFallback(encoderSegment: encoderOutput, decodingOptions: options, callback: callback) else {
                     Logging.error("Unable to decode text")
                     return nil
                 }
 
                 // MARK: Windowing
 
-                // at this point we have a completed window aka segment
+                // At this point we have a completed window aka segment
                 let windowingStart = Date()
 
-                let (newSeek, currentSegments) = segmentSeeker.findSeekPointAndSegments(
+                let previousSeek = seek
+                var (newSeek, currentSegments) = segmentSeeker.findSeekPointAndSegments(
                     decodingResult: decodingResult,
                     options: options,
                     allSegmentsCount: allSegments.count,
                     currentSeek: seek,
                     segmentSize: segmentSize,
                     sampleRate: WhisperKit.sampleRate,
-                    timeToken: tokenizer.timeTokenBegin,
-                    specialToken: tokenizer.specialTokenBegin,
+                    timeToken: tokenizer.specialTokens.timeTokenBegin,
+                    specialToken: tokenizer.specialTokens.specialTokenBegin,
                     tokenizer: tokenizer
                 )
 
-                // Update seek point without moving backward backward
+                // Update seek point without moving backward
                 seek = max(seek, newSeek)
 
-                guard var currentSegments = currentSegments else {
+                // Optionally add word timestamps
+                if options.wordTimestamps,
+                   let alignmentWeights = decodingResult.cache?.alignmentWeights
+                {
+                    let wordTimestampsStart = Date()
+                    currentSegments = try segmentSeeker.addWordTimestamps(
+                        segments: currentSegments ?? [],
+                        alignmentWeights: alignmentWeights,
+                        tokenizer: tokenizer,
+                        seek: previousSeek,
+                        segmentSize: segmentSize,
+                        prependPunctuations: "\"'“¿([{-",
+                        appendPunctuations: "\"'.。,，!！?？:：”)]}、",
+                        lastSpeechTimestamp: currentSegments?.last?.end ?? 0,
+                        options: options,
+                        timings: timings
+                    )
+
+                    timings.decodingWordTimestamps += Date().timeIntervalSince(wordTimestampsStart)
+                    timings.totalTimestampAlignmentRuns += 1
+
+                    // Update seek point with new (more accurate) segments
+                    if let lastSpeechTimestamp = currentSegments?.last?.end {
+                        seek = max(seek, Int(lastSpeechTimestamp * Float(WhisperKit.sampleRate)))
+                    }
+
+                    if options.verbose {
+                        Logging.debug("Word timestamps:")
+                        for segment in currentSegments ?? [] {
+                            for word in segment.words ?? [] {
+                                Logging.debug("[\(word.start.formatted(.number.precision(.significantDigits(3)))) -> \(word.end.formatted(.number.precision(.significantDigits(3))))] prob: \(word.probability), word: \(word.word)")
+                            }
+                        }
+                    }
+                }
+
+                guard let currentSegments = currentSegments else {
                     // No current segment found, skip to next window
                     continue
                 }
@@ -519,23 +640,9 @@ public class WhisperKit {
                     }
                 }
 
-                // Clear invalid segments
-                // remove any segments that have very close start and end times
-                // or that have no text
-                for i in 0..<currentSegments.count {
-                    if currentSegments[i].start == currentSegments[i].end ||
-                        currentSegments[i].text.trimmingCharacters(in: .whitespacesAndNewlines) == "" ||
-                        // TODO: make this more robust or a decoding option, 1s hallucinations are anecdotally common when forcing prefill tokens
-                        (currentSegments[i].end - currentSegments[i].start) <= 1.0
-                    {
-                        currentSegments[i].text = tokenizer.convertIdToToken(tokenizer.noSpeechToken) ?? ""
-                        currentSegments[i].tokens = [tokenizer.noSpeechToken]
-                    }
-                }
-
                 // add them to the `allSegments` list
                 allSegments.append(contentsOf: currentSegments)
-                let allCurrentTokens = currentSegments.reduce([]) { $0 + $1.tokens }
+                let allCurrentTokens = currentSegments.flatMap { $0.tokens }
                 allTokens.append(contentsOf: allCurrentTokens)
 
                 timings.decodingWindowing += Date().timeIntervalSince(windowingStart)
@@ -543,6 +650,9 @@ public class WhisperKit {
 
                 // Reset cache and move on to the next window
                 resetDecoderInputs()
+
+                let clipProgress = min(seek, seekClipEnd) - seekClipStart
+                progress.completedUnitCount = previousSeekProgress + Int64(clipProgress)
             }
         }
 
@@ -562,13 +672,27 @@ public class WhisperKit {
                 Logging.info("Decoding Temperature: \(temp)")
                 let decodeWithFallbackStart = Date()
 
-                let tokenSampler = GreedyTokenSampler(temperature: temp, eotToken: tokenizer.endToken, decodingOptions: options)
+                let tokenSampler = GreedyTokenSampler(temperature: temp, eotToken: tokenizer.specialTokens.endToken, decodingOptions: options)
+
+                var currentDecodingOptions = options
+                // For a multilingual model, if language is not passed and usePrefill is false, detect language and set in options
+                if modelVariant.isMultilingual, options.language == nil, !options.usePrefillPrompt {
+                    let languageDecodingResult = try? await textDecoder.detectLanguage(
+                        from: encoderOutput,
+                        using: decoderInputs,
+                        sampler: tokenSampler,
+                        options: options,
+                        temperature: temp
+                    ).first
+                    detectedLanguage = languageDecodingResult?.language
+                    currentDecodingOptions.language = languageDecodingResult?.language
+                }
 
                 decodingResult = try await textDecoder.decodeText(
                     from: encoderOutput,
                     using: decoderInputs,
                     sampler: tokenSampler,
-                    options: options,
+                    options: currentDecodingOptions,
                     callback: callback
                 ).first
 
@@ -580,6 +704,7 @@ public class WhisperKit {
                     timings.decodingPredictions += decodingTimings.decodingPredictions
                     timings.totalDecodingLoops += decodingTimings.totalDecodingLoops
                     timings.decodingNonPrediction += decodingTimings.decodingNonPrediction
+                    timings.decodingFiltering += decodingTimings.decodingFiltering
                     timings.decodingSampling += decodingTimings.decodingSampling
                     timings.decodingKvCaching += decodingTimings.decodingKvCaching
                     timings.totalKVUpdateRuns += decodingTimings.totalKVUpdateRuns
@@ -587,39 +712,15 @@ public class WhisperKit {
 
                 // MARK: Fallback checks
 
-                var needsFallback = false
-                var fallbackReason = ""
-                if let result = decodingResult {
-                    if let threshold = options.compressionRatioThreshold,
-                       result.compressionRatio > threshold
-                    {
-                        needsFallback = true // too repetitive
-                        fallbackReason = "compressionRatioThreshold"
-                    }
-
-                    if let threshold = options.logProbThreshold,
-                       result.avgLogProb < threshold
-                    {
-                        needsFallback = true // average log probablity too low (model is not confident enough)
-                        fallbackReason = "logProbThreshold"
-                    }
-
-                    if let threshold = options.noSpeechThreshold,
-                       result.noSpeechProb > threshold
-                    {
-                        needsFallback = false // silence
-                    }
-                }
-
-                if !needsFallback {
-                    break
-                } else {
+                if let fallback = decodingResult?.fallback, fallback.needsFallback {
                     // Reset decoder inputs for fallback
                     fallbackCount = Double(i)
                     timings.decodingFallback += Date().timeIntervalSince(decodeWithFallbackStart)
                     timings.totalDecodingFallbacks = fallbackCount
                     resetDecoderInputs()
-                    Logging.info("Fallback #\(fallbackCount + 1) (\(fallbackReason))")
+                    Logging.info("Fallback #\(fallbackCount + 1) (\(fallback.fallbackReason))")
+                } else {
+                    break
                 }
             }
 
@@ -672,10 +773,12 @@ public class WhisperKit {
             let decodingInitTime = formatTimeWithPercentage(timings.decodingInit, 1, fullPipelineDuration)
             let prefillInfo = formatTimeWithPercentage(timings.prefill, 1, fullPipelineDuration)
             let predictionsInfo = formatTimeWithPercentage(timings.decodingPredictions, totalLoops, fullPipelineDuration)
+            let filteringInfo = formatTimeWithPercentage(timings.decodingFiltering, totalLoops, fullPipelineDuration)
             let samplingInfo = formatTimeWithPercentage(timings.decodingSampling, totalLoops, fullPipelineDuration)
             let kvCachingInfo = formatTimeWithPercentage(timings.decodingKvCaching, timings.totalKVUpdateRuns, fullPipelineDuration)
+            let wordTimestampInfo = formatTimeWithPercentage(timings.decodingWordTimestamps, timings.totalTimestampAlignmentRuns, fullPipelineDuration)
             let nonPredTimeInfo = formatTimeWithPercentage(timings.decodingNonPrediction, totalLoops, fullPipelineDuration)
-            let windowingInfo = formatTimeWithPercentage(timings.decodingWindowing, timings.totalDecodingWindows, fullPipelineDuration)
+            let windowingInfo = formatTimeWithPercentage(timings.decodingWindowing - timings.decodingWordTimestamps, timings.totalDecodingWindows, fullPipelineDuration)
             let fallbackInfo = formatTimeWithPercentage(timings.decodingFallback, timings.totalDecodingFallbacks, fullPipelineDuration)
             let decodingLoopInfo = formatTimeWithPercentage(timings.decodingLoop, totalLoops, fullPipelineDuration)
 
@@ -690,8 +793,10 @@ public class WhisperKit {
             Logging.info("Prefill:             \(prefillInfo)")
             Logging.info("Decoding:            \(predictionsInfo)")
             Logging.info("Non-inference:       \(nonPredTimeInfo)")
+            Logging.info("- Logit Filtering:   \(filteringInfo)")
             Logging.info("- Sampling:          \(samplingInfo)")
             Logging.info("- Kv Caching:        \(kvCachingInfo)")
+            Logging.info("- Word Timestamps:   \(wordTimestampInfo)")
             Logging.info("- Windowing:         \(windowingInfo)")
             Logging.info("Fallbacks:           \(fallbackInfo)")
             Logging.info("Decoding Full Loop:  \(decodingLoopInfo)")
@@ -717,11 +822,11 @@ public class WhisperKit {
             Logging.debug(line)
         }
 
-        let wordTokens = allTokens.filter { $0 < tokenizer.specialTokenBegin }
+        let wordTokens = allTokens.filter { $0 < tokenizer.specialTokens.specialTokenBegin }
         transcription = tokenizer.decode(tokens: wordTokens)
 
         transcription = transcription.trimmingCharacters(in: .whitespaces)
 
-        return TranscriptionResult(text: transcription, segments: allSegments, language: "en", timings: timings)
+        return TranscriptionResult(text: transcription, segments: allSegments, language: detectedLanguage ?? "en", timings: timings)
     }
 }
