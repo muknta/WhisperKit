@@ -348,11 +348,13 @@ public class WhisperKit: Transcriber {
         textDecoder.isModelMultilingual = isModelMultilingual(logitsDim: logitsDim)
         modelVariant = detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
         Logging.debug("Loading tokenizer for \(modelVariant)")
-        let tokenizer = try await loadTokenizer(
-                    for: modelVariant,
-                    tokenizerFolder: tokenizerFolder,
-                    useBackgroundSession: useBackgroundDownloadSession
-                )
+        let tokenizer = try WhisperTokenizerWrapper(
+            tokenizer: AutoTokenizer.from(
+                tokenizerConfig: configuration(from: tokenizerConfigUrl),
+                tokenizerData: configuration(from: tokenizerDataUrl)
+            )
+        )
+
         self.tokenizer = tokenizer
         textDecoder.tokenizer = tokenizer
         Logging.debug("Loaded tokenizer")
